@@ -5,7 +5,9 @@ Exposes GL.iNet Flint 2 (GL-MT6000) router API as MCP tools.
 Transport: HTTP/SSE (Claude desktop connects over LAN).
 """
 
+import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,7 +32,7 @@ def load_config() -> dict:
         return json.load(f)
 
 cfg = load_config()
-ROUTER_URL = cfg["router_url"].rstrip("/")   # e.g. http://192.168.8.1
+ROUTER_URL = cfg["router_url"].rstrip("/")
 PASSWORD   = cfg["password"]
 TIMEOUT    = cfg.get("timeout", 10)
 
@@ -38,47 +40,94 @@ TIMEOUT    = cfg.get("timeout", 10)
 
 _session_token: str | None = None
 
-def _rpc(sid: str, subsystem: str, method: str, params: dict | None = None) -> Any:
+
+def _post(payload: dict) -> dict:
+    """Raw POST to /rpc, returns parsed JSON."""
+    r = httpx.post(f"{ROUTER_URL}/rpc", json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def _login() -> str:
+    """
+    GL.iNet firmware 4.x challenge-response auth:
+      1. POST {"method":"challenge","params":{"username":"root"}}
+         -> {"result":{"nonce":"...","alg":5,"salt":"..."}}
+      2. crypt_pw = openssl passwd -<alg> -salt <salt> <password>
+      3. hash = sha256hex("root:" + crypt_pw + ":" + nonce)
+      4. POST {"method":"login","params":{"username":"root","hash":"<hash>"}}
+         -> {"result":{"sid":"..."}}
+    """
+    # Step 1: challenge
+    ch = _post({"jsonrpc": "2.0", "id": 1, "method": "challenge",
+                "params": {"username": "root"}})
+    if "error" in ch:
+        raise RuntimeError(f"Challenge failed: {ch['error']}")
+    c = ch["result"]
+    nonce, alg, salt = c["nonce"], c["alg"], c["salt"]
+
+    # Step 2: crypt-hash the password (same algo used in /etc/shadow)
+    crypt_pw = subprocess.run(
+        ["openssl", "passwd", f"-{alg}", "-salt", salt, PASSWORD],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    # Step 3: sha256("root:<crypt_pw>:<nonce>")
+    login_hash = hashlib.sha256(f"root:{crypt_pw}:{nonce}".encode()).hexdigest()
+
+    # Step 4: login
+    lr = _post({"jsonrpc": "2.0", "id": 2, "method": "login",
+                "params": {"username": "root", "hash": login_hash}})
+    if "error" in lr:
+        raise RuntimeError(f"Login failed: {lr['error']}")
+
+    sid = lr.get("result", {}).get("sid")
+    if not sid:
+        raise RuntimeError(f"No SID in login response: {lr}")
+    return sid
+
+
+def get_token() -> str:
+    global _session_token
+    if _session_token:
+        try:
+            resp = _post({"jsonrpc": "2.0", "id": 3, "method": "alive",
+                          "params": {"sid": _session_token}})
+            if "error" not in resp:
+                return _session_token
+        except Exception:
+            pass
+    _session_token = _login()
+    return _session_token
+
+
+def _rpc(subsystem: str, method: str, params: dict | None = None) -> Any:
+    """Make an authenticated call via method='call' format."""
+    global _session_token
+    sid = get_token()
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "call",
         "params": [sid, subsystem, method, params or {}],
     }
-    r = httpx.post(f"{ROUTER_URL}/rpc", json=payload, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+    data = _post(payload)
     if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
+        # Session may have expired — retry once with fresh auth
+        _session_token = None
+        sid = get_token()
+        payload["params"][0] = sid
+        data = _post(payload)
+        if "error" in data:
+            raise RuntimeError(f"RPC error: {data['error']}")
     return data.get("result")
 
 
-def get_token() -> str:
-    global _session_token
-    if _session_token:
-        # probe with a cheap call; re-auth if stale
-        try:
-            result = _rpc(_session_token, "system", "get_hostname", {})
-            if result is not None:
-                return _session_token
-        except Exception:
-            pass
-
-    result = _rpc(
-        "00000000000000000000000000000000",
-        "system", "login",
-        {"username": "root", "password": PASSWORD},
-    )
-    if not result or not result.get("sid"):
-        raise RuntimeError("Authentication failed — check password in config.json")
-    _session_token = result["sid"]
-    return _session_token
-
-
-def call(subsystem: str, method: str, params: dict | None = None) -> Any:
-    """Authenticate (if needed) and make an RPC call."""
-    sid = get_token()
-    return _rpc(sid, subsystem, method, params or {})
+def _safe_rpc(subsystem: str, method: str, params: dict | None = None) -> Any:
+    try:
+        return _rpc(subsystem, method, params)
+    except Exception as e:
+        return {"error": str(e)}
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
 
@@ -165,64 +214,51 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 def _dispatch(name: str, args: dict) -> Any:
     if name == "get_router_status":
-        info     = call("system", "get_info")
-        hw       = call("system", "get_hardware")
-        mem      = call("system", "get_mem")
-        cpu      = call("system", "get_cpu")
-        temp_raw = call("system", "get_temp")
         return {
-            "model":    hw.get("model") if hw else None,
-            "firmware": info.get("firmware") if info else None,
-            "uptime_s": info.get("uptime") if info else None,
-            "load":     cpu if cpu else None,
-            "memory":   mem if mem else None,
-            "temp_c":   temp_raw if temp_raw else None,
+            "info":   _safe_rpc("system", "get_info"),
+            "hw":     _safe_rpc("system", "get_hardware"),
+            "memory": _safe_rpc("system", "get_mem"),
+            "cpu":    _safe_rpc("system", "get_cpu"),
+            "temp":   _safe_rpc("system", "get_temp"),
         }
 
     elif name == "get_wan_status":
-        return call("network", "get_wan_status")
+        return _rpc("network", "get_wan_status")
 
     elif name == "get_clients":
-        return call("router.clients", "get_list")
+        return _rpc("clients", "get_list")
 
     elif name == "get_interfaces":
-        return call("network", "get_status")
+        return _rpc("network", "get_status")
 
     elif name == "get_vpn_status":
-        wg  = _safe_call("vpn.wireguard.client", "get_status")
-        ovpn = _safe_call("vpn.openvpn.client", "get_status")
-        wg_srv  = _safe_call("vpn.wireguard.server", "get_status")
         return {
-            "wireguard_client": wg,
-            "wireguard_server": wg_srv,
-            "openvpn_client":   ovpn,
+            "wireguard_client": _safe_rpc("wg-client", "get_status"),
+            "wireguard_server": _safe_rpc("wg-server", "get_status"),
+            "openvpn_client":   _safe_rpc("ovpn_client", "get_status"),
         }
 
     elif name == "get_system_log":
         lines = int(args.get("lines", 100))
-        raw = call("system", "get_log")
+        raw = _rpc("logread", "get_log")
         if isinstance(raw, str):
             return {"log": raw.splitlines()[-lines:]}
+        if isinstance(raw, list):
+            return {"log": raw[-lines:]}
         return {"log": raw}
 
     elif name == "get_wifi_status":
-        radio24 = _safe_call("network.wireless", "get_status", {"band": "2g"})
-        radio5  = _safe_call("network.wireless", "get_status", {"band": "5g"})
-        return {"2g": radio24, "5g": radio5}
+        return {
+            "2g": _safe_rpc("wifi", "get_status", {"band": "2g"}),
+            "5g": _safe_rpc("wifi", "get_status", {"band": "5g"}),
+        }
 
     elif name == "reboot_router":
-        call("system", "reboot")
+        _rpc("system", "reboot")
         return {"status": "reboot initiated"}
 
     else:
         raise ValueError(f"Unknown tool: {name}")
-
-
-def _safe_call(subsystem: str, method: str, params: dict | None = None) -> Any:
-    try:
-        return call(subsystem, method, params)
-    except Exception as e:
-        return {"error": str(e)}
 
 # ── SSE transport + Starlette app ──────────────────────────────────────────────
 
