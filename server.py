@@ -214,12 +214,21 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 def _dispatch(name: str, args: dict) -> Any:
     if name == "get_router_status":
+        info = _safe_rpc("system", "get_info")
+        load = _safe_rpc("system", "get_load")
+        now  = _safe_rpc("system", "get_unixtime")
         return {
-            "info":   _safe_rpc("system", "get_info"),
-            "hw":     _safe_rpc("system", "get_hardware"),
-            "memory": _safe_rpc("system", "get_mem"),
-            "cpu":    _safe_rpc("system", "get_cpu"),
-            "temp":   _safe_rpc("system", "get_temp"),
+            "model":            info.get("model") if info else None,
+            "firmware_version": info.get("firmware_version") if info else None,
+            "firmware_date":    info.get("firmware_date") if info else None,
+            "hostname":         info.get("board_info", {}).get("hostname") if info else None,
+            "kernel":           info.get("board_info", {}).get("kernel_version") if info else None,
+            "cpu_cores":        info.get("cpu_num") if info else None,
+            "load_average":     load.get("load_average") if load else None,
+            "memory_total_mb":  round(load["memory_total"] / 1024**2) if load else None,
+            "memory_free_mb":   round(load["memory_free"] / 1024**2) if load else None,
+            "memory_used_mb":   round((load["memory_total"] - load["memory_free"]) / 1024**2) if load else None,
+            "unixtime":         now.get("time") if now else None,
         }
 
     elif name == "get_wan_status":
@@ -240,12 +249,9 @@ def _dispatch(name: str, args: dict) -> Any:
 
     elif name == "get_system_log":
         lines = int(args.get("lines", 100))
-        raw = _rpc("logread", "get_log")
-        if isinstance(raw, str):
-            return {"log": raw.splitlines()[-lines:]}
-        if isinstance(raw, list):
-            return {"log": raw[-lines:]}
-        return {"log": raw}
+        raw = _rpc("logread", "get_system_log", {"log_number": lines})
+        log_text = raw.get("log", "") if isinstance(raw, dict) else str(raw)
+        return {"log": log_text.splitlines()[-lines:]}
 
     elif name == "get_wifi_status":
         return {
@@ -262,19 +268,28 @@ def _dispatch(name: str, args: dict) -> Any:
 
 # ── SSE transport + Starlette app ──────────────────────────────────────────────
 
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import Scope, Receive, Send
+
 sse = SseServerTransport("/messages/")
 
-async def handle_sse(request):
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
+
+async def _handle_sse(scope: Scope, receive: Receive, send: Send) -> Response:
+    async with sse.connect_sse(scope, receive, send) as streams:
         await app.run(
             streams[0], streams[1], app.create_initialization_options()
         )
+    return Response()
+
+
+async def sse_endpoint(request: Request) -> Response:
+    return await _handle_sse(request.scope, request.receive, request._send)
+
 
 starlette_app = Starlette(
     routes=[
-        Route("/sse", endpoint=handle_sse),
+        Route("/sse", endpoint=sse_endpoint, methods=["GET"]),
         Mount("/messages/", app=sse.handle_post_message),
     ]
 )
